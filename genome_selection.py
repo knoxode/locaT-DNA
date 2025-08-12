@@ -26,57 +26,68 @@ def checkAvailableGenomes() -> pd.DataFrame:
 
 
 def select_reference_genome():
+    if "genome_confirmed" not in st.session_state:
+        st.session_state.genome_confirmed = False
+
     df = checkAvailableGenomes()
     if df.empty:
         return None
 
-    # 1) Species
-    species_options = sorted(df["species"].dropna().unique().tolist())
-    species = st.selectbox("Species", species_options, key="species_select")
+    if not st.session_state.genome_confirmed:
+        # Selection widgets
+        species_options = sorted(df["species"].dropna().unique().tolist())
+        species = st.selectbox("Species", species_options, key="species_select")
 
-    df_s = df[df["species"] == species]
-    if df_s.empty:
-        st.error("No entries for the selected species.")
+        df_s = df[df["species"] == species]
+        provider_options = sorted(df_s["provider"].dropna().unique().tolist())
+        provider = st.selectbox("Provider", provider_options, key="provider_select")
+
+        df_sp = df_s[df_s["provider"] == provider]
+        assembly_options = sorted(df_sp["assembly"].dropna().unique().tolist())
+        assembly = st.selectbox("Assembly", assembly_options, key="assembly_select")
+
+        df_sel = df_sp[df_sp["assembly"] == assembly]
+        if df_sel.empty:
+            st.error("No entries for the selected species/provider/assembly.")
+            return None
+
+        row = df_sel.iloc[0]
+        anno_path = row.get("anno_gz_path") or row.get("anno_plain_path")
+
+        result = {
+            "provider": provider,
+            "species": species,
+            "assembly": assembly,
+            "genome_path": row.get("genome_path"),
+            "annotation_path": anno_path,
+            "annotation_ext": row.get("anno_ext"),
+            "genome_is_gz": bool(row.get("genome_is_gz")),
+        }
+
+        if st.button("Confirm genome selection"):
+            st.session_state.genome_confirmed = True
+            st.session_state.genome_selection = result
+
+    if st.session_state.genome_confirmed:
+        result = st.session_state.genome_selection
+        st.write("### Confirmed Selections:")
+        st.write(f""" Provider: {result["provider"]}""")
+        st.write(f""" Genome: {result["species"]}""")
+        st.write(f""" Assembly: {result["assembly"]}""")
+        return result
+
+    return None
+
+
+def store_reference_path(workspace, selection):
+    """
+    Store the selected reference genome path in the workspace for later use.
+    """
+    ref_path = selection.get("genome_path")
+    if not ref_path:
+        st.error("No genome path found in selection.")
         return None
 
-    # 2) Provider
-    provider_options = sorted(df_s["provider"].dropna().unique().tolist())
-    provider = st.selectbox("Provider", provider_options, key="provider_select")
-
-    df_sp = df_s[df_s["provider"] == provider]
-    if df_sp.empty:
-        st.error("No entries for the selected species/provider.")
-        return None
-
-    # 3) Assembly
-    assembly_options = sorted(df_sp["assembly"].dropna().unique().tolist())
-    assembly = st.selectbox("Assembly", assembly_options, key="assembly_select")
-
-    df_sel = df_sp[df_sp["assembly"] == assembly]
-    if df_sel.empty:
-        st.error("No entries for the selected species/provider/assembly.")
-        return None
-
-    row = df_sel.iloc[0]
-    anno_path = row.get("anno_gz_path") or row.get("anno_plain_path")
-
-    result = {
-        "provider": provider,
-        "species": species,
-        "assembly": assembly,
-        "genome_path": row.get("genome_path"),
-        "annotation_path": anno_path,
-        "annotation_ext": row.get("anno_ext"),
-        "genome_is_gz": bool(row.get("genome_is_gz")),
-    }
-
-    with st.expander("Selected reference summary", expanded=False):
-        st.write(
-            {
-                "Genome": result["genome_path"],
-                "Annotation": result["annotation_path"],
-                "Type": result["annotation_ext"],
-            }
-        )
-
-    return result
+    ref_file = workspace.base_dir / "reference_path.txt"
+    ref_file.write_text(ref_path)
+    return ref_file

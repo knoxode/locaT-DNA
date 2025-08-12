@@ -1,21 +1,18 @@
 import streamlit as st
 
-
-def sample_upload():
-    uploaded = st.file_uploader(
+def sample_upload(workspace):
+    uploaded_samples = st.file_uploader(
         "Upload FASTQ, FASTA, or zipped folder",
         type=["fastq", "fq", "fastq.gz", "fa", "fasta", "fa.gz", "zip"],
+        accept_multiple_files=True
     )
 
-    if uploaded:
-        filename = uploaded.name.lower()
-
-        if filename.endswith(".zip"):
-            tmpdir = tempfile.mkdtemp()
-            with zipfile.ZipFile(uploaded, "r") as z:
-                z.extractall(tmpdir)
-            st.success(f"Extracted {filename} to {tmpdir}")
-            st.write("Files found:", list(pathlib.Path(tmpdir).rglob("*")))
-
-        else:
-            st.info(f"Got single file: {uploaded.name}")
+    if uploaded_samples:
+        st.info(
+            "You can upload multiple files. If you have many files, consider zipping them into a single archive."
+        )
+        for u in uploaded_samples:
+            path = workspace.save_file(u, "samples")
+        st.toast(
+            "All sample FASTA files were successfully uploaded.", icon="✅"
+        )
