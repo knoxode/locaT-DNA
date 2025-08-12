@@ -1,56 +1,82 @@
-import re, requests, pandas as pd, streamlit as st
+import streamlit as st
+import pandas as pd
+import json
+from pathlib import Path
 
-MANIFEST_URL = "https://raw.githubusercontent.com/ewels/AWS-iGenomes/master/ngi-igenomes_file_manifest.txt"
-
-
-# a simple allow-list of plant species names seen in iGenomes; expand anytime
-PLANT_SPECIES_KEYS = {
-    "Arabidopsis_thaliana",
-    "Oryza_sativa_japonica",
-    "Zea_mays",
-    "Sorghum_bicolor",
-    "Glycine_max",
-    "Solanum_lycopersicum",
-    "Brachypodium_distachyon",
-    "Populus_trichocarpa",
-    "Physcomitrella_patens",
-    "Setaria_italica",
-}
+PUBLISHED_INDEX_PATH = Path(
+    "/home/shaiikura/.cache/locaT-DNA/publish/index.json"
+)  # adjust if needed
 
 
-@st.cache_data(ttl=24 * 60 * 60)
-def load_igenomes():
-    # Parse S3 paths like:
-    # s3://ngi-igenomes/igenomes/<Genome>/<Source>/<Build>/<TopDir>/...
-    txt = requests.get(MANIFEST_URL, timeout=30).text
-    rows = []
-    for line in txt.splitlines():
-        m = re.match(
-            r"s3://ngi-igenomes/igenomes/([^/]+)/([^/]+)/([^/]+)/([^/]+)/(.+)$", line
-        )
-        if m:
-            genome, source, build, topdir, rest = m.groups()
-            rows.append((genome, source, build, topdir, rest))
-    df = pd.DataFrame(rows, columns=["genome", "source", "build", "topdir", "path"])
-    # keep only plants (by species folder name)
-    df = df[df["genome"].isin(PLANT_SPECIES_KEYS)]
+@st.cache_data(ttl=300)
+def _load_index_df() -> pd.DataFrame:
+    if not PUBLISHED_INDEX_PATH.exists():
+        st.warning(f"Index file not found: {PUBLISHED_INDEX_PATH}")
+        return pd.DataFrame()
+    data = json.loads(PUBLISHED_INDEX_PATH.read_text())
+    entries = data.get("entries", [])
+    return pd.DataFrame(entries)
+
+
+def checkAvailableGenomes() -> pd.DataFrame:
+    df = _load_index_df()
+    if df.empty:
+        st.warning("No published genomes found. Has the cache timer run yet?")
     return df
 
 
 def select_reference_genome():
-    df = load_igenomes()
-
-    # Pretty display names
-    def pretty_label(genome, source, build):
-        return f"{genome.replace('_',' ')} ({build}, {source})"
-
-    # Dropdown
-    choice = st.selectbox(
-        "Select plant reference (FASTA + annotation will be fetched automatically)",
-        [pretty_label(*x) for x in df.to_records(index=False)],
-        index=None,
-        placeholder="Type to search...",
-    )
-
-    if not choice:
+    df = checkAvailableGenomes()
+    if df.empty:
         return None
+
+    # 1) Species
+    species_options = sorted(df["species"].dropna().unique().tolist())
+    species = st.selectbox("Species", species_options, key="species_select")
+
+    df_s = df[df["species"] == species]
+    if df_s.empty:
+        st.error("No entries for the selected species.")
+        return None
+
+    # 2) Provider
+    provider_options = sorted(df_s["provider"].dropna().unique().tolist())
+    provider = st.selectbox("Provider", provider_options, key="provider_select")
+
+    df_sp = df_s[df_s["provider"] == provider]
+    if df_sp.empty:
+        st.error("No entries for the selected species/provider.")
+        return None
+
+    # 3) Assembly
+    assembly_options = sorted(df_sp["assembly"].dropna().unique().tolist())
+    assembly = st.selectbox("Assembly", assembly_options, key="assembly_select")
+
+    df_sel = df_sp[df_sp["assembly"] == assembly]
+    if df_sel.empty:
+        st.error("No entries for the selected species/provider/assembly.")
+        return None
+
+    row = df_sel.iloc[0]
+    anno_path = row.get("anno_gz_path") or row.get("anno_plain_path")
+
+    result = {
+        "provider": provider,
+        "species": species,
+        "assembly": assembly,
+        "genome_path": row.get("genome_path"),
+        "annotation_path": anno_path,
+        "annotation_ext": row.get("anno_ext"),
+        "genome_is_gz": bool(row.get("genome_is_gz")),
+    }
+
+    with st.expander("Selected reference summary", expanded=False):
+        st.write(
+            {
+                "Genome": result["genome_path"],
+                "Annotation": result["annotation_path"],
+                "Type": result["annotation_ext"],
+            }
+        )
+
+    return result

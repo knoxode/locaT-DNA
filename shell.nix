@@ -5,6 +5,7 @@ pkgs.mkShell {
     (python312.withPackages (ps:
       with ps; [
         streamlit
+        pyaml
       ]))
 
     # Non-Python tools from nixpkgs
