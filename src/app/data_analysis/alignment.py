@@ -1,5 +1,6 @@
 import subprocess
 import streamlit as st
+from session_management.workspace import Workspace
 
 def run_batch_alignment(workspace: Workspace, reference_path: str, threads: int = 4):
     sample_dir = workspace.get_dir("samples")

@@ -3,26 +3,28 @@
 locaT-DNA reference cache (YAML-driven, multi-source)
 
 - Reads a catalog of genomes from BASE/sources.yaml (or $LOCAT_DNA_SOURCES).
-- Downloads FASTA (.fa.gz) and GTF (.gtf.gz) with ETag/Last-Modified caching.
-- Decompresses FASTA to .fa and indexes (.fai) via pyfaidx or samtools.
-- Publishes stable symlinks per source.
+- Downloads FASTA (.fa.gz) and GTF/GFF (.gtf.gz/.gff.gz/.gff3.gz) with ETag/Last-Modified caching.
+- Decompresses FASTA to .fa and indexes (.fai) via samtools.
+- Publishes stable *files* (copies) per source (no symlinks).
 - Writes a single manifest.json aggregating all sources.
 
-Layout (BASE=/home/shaiikura/.cache/locaT-DNA by default)
+Layout (BASE=/var/lib/locaT-DNA by default)
 BASE/
   cache/{provider}/{species}/{assembly}/
     raw/
       genome.fa.gz         # downloaded (has .etag/.lastmod)
-      genes.gtf.gz
+      genes.{gtf|gff|gff3}.gz
     ready/
       genome.fa            # unzipped
       genome.fa.fai
-      genes.gtf.gz         # symlink (or copy) to raw/genes.gtf.gz
+      genes.{gtf|gff|gff3}.gz  # copied from raw
+      genes.{gtf|gff|gff3}     # uncompressed
   publish/{provider}/{species}/
-    genome.fa     -> ../../../../cache/.../ready/genome.fa
-    genes.gtf.gz  -> ../../../../cache/.../ready/genes.gtf.gz
+    genome.fa
+    genes.{gtf|gff|gff3}.gz
+    genes.{gtf|gff|gff3}
   manifest.json
-  sources.yaml    # <-- your catalog goes here (or set LOCAT_DNA_SOURCES)
+  sources.yaml
 """
 
 from __future__ import annotations
@@ -41,21 +43,11 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import requests
-
-# Optional dependencies
-try:
-    import yaml  # PyYAML for sources.yaml
-except Exception:
-    yaml = None
-
-try:
-    from pyfaidx import Fasta  # for indexing (fallback to samtools)
-except Exception:
-    Fasta = None
+import yaml  # required
 
 # ---------------- Config & defaults ----------------
 
-BASE = Path(os.getenv("LOCAT_DNA_BASE", "/home/shaiikura/.cache/locaT-DNA"))
+BASE = Path(os.getenv("LOCAT_DNA_BASE", "/var/lib/locaT-DNA"))
 CACHE_ROOT = Path(os.getenv("LOCAT_DNA_CACHE", str(BASE / "cache")))
 PUBLISH_ROOT = Path(os.getenv("LOCAT_DNA_PUBLISH", str(BASE / "publish")))
 PUBLISHED_INDEX_PATH = Path(
@@ -76,7 +68,7 @@ class SourceSpec:
     assembly: str  # e.g., TAIR10
     fasta_url: str
     anno_url: Optional[str] = None
-    decompress_fasta: bool = True  # keep True: samtools can't index .fa.gz
+    decompress_fasta: bool = True  # samtools needs plain .fa
 
 
 @dataclass
@@ -94,18 +86,14 @@ class Paths:
 
 # ---------------- Helpers ----------------
 
-
 def safe_makedirs(p: Path):
     p.mkdir(parents=True, exist_ok=True)
-
 
 def etag_path(target: Path) -> Path:
     return target.with_suffix(target.suffix + ".etag")
 
-
 def lm_path(target: Path) -> Path:
     return target.with_suffix(target.suffix + ".lastmod")
-
 
 @contextlib.contextmanager
 def file_lock(lockfile: Path):
@@ -122,10 +110,8 @@ def file_lock(lockfile: Path):
         except FileNotFoundError:
             pass
 
-
 def run_cmd(cmd: List[str]):
     subprocess.run(cmd, check=True)
-
 
 def download_with_cache(url: str, target: Path) -> bool:
     safe_makedirs(target.parent)
@@ -136,9 +122,7 @@ def download_with_cache(url: str, target: Path) -> bool:
         headers["If-None-Match"] = etag_file.read_text().strip()
     if lm_file.exists():
         headers["If-Modified-Since"] = lm_file.read_text().strip()
-    with SESSION.get(
-        url, stream=True, headers=headers, timeout=600, allow_redirects=True
-    ) as r:
+    with SESSION.get(url, stream=True, headers=headers, timeout=600, allow_redirects=True) as r:
         if r.status_code == 304:
             return False
         r.raise_for_status()
@@ -153,7 +137,6 @@ def download_with_cache(url: str, target: Path) -> bool:
         if lastmod := r.headers.get("Last-Modified"):
             lm_file.write_text(lastmod)
         return True
-
 
 def layout(cache_root: Path, s: SourceSpec) -> Paths:
     base = cache_root / s.provider / s.species / s.assembly
@@ -176,7 +159,6 @@ def layout(cache_root: Path, s: SourceSpec) -> Paths:
         ready_anno_gz=ready_anno_gz,
     )
 
-
 def guess_anno_ext(url: str) -> str:
     """
     Guess '.gff3', '.gff', or '.gtf' from the URL. Defaults to '.gtf'.
@@ -184,9 +166,8 @@ def guess_anno_ext(url: str) -> str:
     u = url.lower()
     for ext in (".gff3.gz", ".gff.gz", ".gtf.gz", ".gff3", ".gff", ".gtf"):
         if u.endswith(ext):
-            return "." + ext.lstrip(".").split(".")[0]  # -> .gff3 / .gff / .gtf
+            return "." + ext.lstrip(".").split(".")[0]
     return ".gtf"
-
 
 def sniff_compression(path: Path) -> str:
     """
@@ -203,13 +184,11 @@ def sniff_compression(path: Path) -> str:
         return "xz"
     return "plain"
 
-
 def decompress_any(src_path: Path, dst_path: Path, lock: bool = True) -> None:
     """
     Decompress/copy src_path -> dst_path based on detected compression type.
     Uses an atomic .part file then moves into place.
     """
-
     def _open(src: Path):
         kind = sniff_compression(src)
         if kind == "gzip":
@@ -228,7 +207,6 @@ def decompress_any(src_path: Path, dst_path: Path, lock: bool = True) -> None:
         with _open(src_path) as fin, open(tmp, "wb") as fout:
             shutil.copyfileobj(fin, fout)
         shutil.move(tmp, dst_path)
-
 
 def _build_published_record(
     s: SourceSpec, publish_root: Path, fasta_meta: Dict, gtf_meta: Optional[Dict]
@@ -261,14 +239,8 @@ def _build_published_record(
         "genome_path": str(genome_path) if genome_path else None,
         "genome_is_gz": bool(genome_path and genome_path.suffix == ".gz"),
         "anno_ext": anno_ext,
-        "anno_gz_path": (
-            str(anno_gz_path) if anno_gz_path and anno_gz_path.exists() else None
-        ),
-        "anno_plain_path": (
-            str(anno_plain_path)
-            if anno_plain_path and anno_plain_path.exists()
-            else None
-        ),
+        "anno_gz_path": (str(anno_gz_path) if anno_gz_path and anno_gz_path.exists() else None),
+        "anno_plain_path": (str(anno_plain_path) if anno_plain_path and anno_plain_path.exists() else None),
         "genome_size": genome_size,
         "genome_mtime": genome_mtime,
         "anno_gz_size": anno_gz_size,
@@ -276,7 +248,6 @@ def _build_published_record(
         "anno_plain_size": anno_plain_size,
         "anno_plain_mtime": anno_plain_mtime,
     }
-
 
 def write_published_index(
     publish_root: Path, entries: List[Dict], path: Path = PUBLISHED_INDEX_PATH
@@ -295,9 +266,7 @@ def write_published_index(
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
     shutil.move(tmp, path)
 
-
 # ---------------- Core ops ----------------
-
 
 def grab_fasta(cache_root: Path, s: SourceSpec) -> Dict:
     p = layout(cache_root, s)
@@ -311,14 +280,8 @@ def grab_fasta(cache_root: Path, s: SourceSpec) -> Dict:
     if s.decompress_fasta and (changed or not p.ready_fa.exists()):
         decompress_any(p.raw_fa_gz, p.ready_fa)
 
-    # Index
-    if Fasta is not None:
-        _ = Fasta(str(target_fa), rebuild=True)
-    else:
-        try:
-            run_cmd(["samtools", "faidx", str(target_fa)])
-        except FileNotFoundError:
-            pass
+    # Index (container always has samtools)
+    run_cmd(["samtools", "faidx", str(target_fa)])
 
     st = Path(target_fa).stat()
     return {
@@ -330,7 +293,6 @@ def grab_fasta(cache_root: Path, s: SourceSpec) -> Dict:
         "mtime": int(st.st_mtime),
     }
 
-
 def grab_gtf(cache_root: Path, s: SourceSpec) -> Optional[Dict]:
     if not s.anno_url:
         return None
@@ -341,13 +303,10 @@ def grab_gtf(cache_root: Path, s: SourceSpec) -> Optional[Dict]:
     with file_lock(p.raw_anno_gz.with_suffix(p.raw_anno_gz.suffix + ".lock")):
         changed = download_with_cache(s.anno_url, p.raw_anno_gz)
 
-    # ready/ points to raw/
+    # ready/ now contains a real file (copy) instead of a symlink
     if p.ready_anno_gz.exists() or p.ready_anno_gz.is_symlink():
         p.ready_anno_gz.unlink()
-    try:
-        p.ready_anno_gz.symlink_to(p.raw_anno_gz.resolve())
-    except OSError:
-        shutil.copy2(p.raw_anno_gz, p.ready_anno_gz)
+    shutil.copy2(p.raw_anno_gz, p.ready_anno_gz)
 
     # Also provide an uncompressed file in ready/ with the right extension
     ready_plain = p.ready_anno_gz.with_suffix("")  # drop .gz -> genes{ext}
@@ -365,11 +324,10 @@ def grab_gtf(cache_root: Path, s: SourceSpec) -> Optional[Dict]:
         "size_bytes_uncompressed": st_plain.st_size,
         "mtime_gz": int(st_gz.st_mtime),
         "mtime_uncompressed": int(st_plain.st_mtime),
-        "ext": p.anno_ext,  # handy for callers
+        "ext": p.anno_ext,
     }
 
-
-def provide_symlinks(
+def provide_symlinks(  # kept name for minimal diff; now copies instead
     publish_root: Path, s: SourceSpec, fasta_meta: Dict, gtf_meta: Optional[Dict]
 ):
     out = publish_root / s.provider / s.species
@@ -379,7 +337,7 @@ def provide_symlinks(
     fa_dst = out / ("genome.fa" if fa_src.suffix != ".gz" else "genome.fa.gz")
     if fa_dst.exists() or fa_dst.is_symlink():
         fa_dst.unlink()
-    fa_dst.symlink_to(fa_src)
+    shutil.copy2(fa_src, fa_dst)
 
     if gtf_meta:
         # gz
@@ -387,59 +345,31 @@ def provide_symlinks(
         anno_gz_dst = out / f"genes{gtf_meta.get('ext', '.gtf')}.gz"
         if anno_gz_dst.exists() or anno_gz_dst.is_symlink():
             anno_gz_dst.unlink()
-        anno_gz_dst.symlink_to(anno_gz_src)
+        shutil.copy2(anno_gz_src, anno_gz_dst)
 
-        # plain (optional, but useful)
+        # plain
         anno_plain_src = Path(gtf_meta["file_uncompressed"]).resolve()
         anno_plain_dst = out / f"genes{gtf_meta.get('ext', '.gtf')}"
         if anno_plain_dst.exists() or anno_plain_dst.is_symlink():
             anno_plain_dst.unlink()
-        anno_plain_dst.symlink_to(anno_plain_src)
-
+        shutil.copy2(anno_plain_src, anno_plain_dst)
 
 # ---------------- Catalog loading ----------------
 
-
 def load_catalog() -> List[SourceSpec]:
-    if SOURCES_PATH.suffix.lower() == ".json" and SOURCES_PATH.exists():
-        cfg = json.loads(SOURCES_PATH.read_text()) or {}
-        items = cfg.get("sources") or []
-        return [_spec_from_dict(item) for item in items]
-
-    if SOURCES_PATH.exists():
-        if yaml is None:
-            raise SystemExit(
-                f"ERROR: {SOURCES_PATH} exists but PyYAML is not installed. "
-                "Install pyyaml (or set LOCAT_DNA_SOURCES to a .json file)."
-            )
-        cfg = yaml.safe_load(SOURCES_PATH.read_text()) or {}
-        items = cfg.get("sources") or []
-        return [_spec_from_dict(item) for item in items]
-
-    # Fallback: Arabidopsis only
-    return [
-        SourceSpec(
-            provider="ensemblplants",
-            species="Arabidopsis_thaliana",
-            assembly="TAIR10",
-            fasta_url=(
-                "https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/fasta/"
-                "arabidopsis_thaliana/dna/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa.gz"
-            ),
-            anno_url=(
-                "https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/gtf/"
-                "arabidopsis_thaliana/Arabidopsis_thaliana.TAIR10.gtf.gz"
-            ),
-            decompress_fasta=True,
-        )
-    ]
-
+    if not SOURCES_PATH.exists():
+        raise SystemExit(f"ERROR: sources file not found: {SOURCES_PATH}")
+    cfg = yaml.safe_load(SOURCES_PATH.read_text()) or {}
+    items = cfg.get("sources") or []
+    if not items:
+        raise SystemExit(f"ERROR: no 'sources' entries found in {SOURCES_PATH}")
+    return [_spec_from_dict(item) for item in items]
 
 def _spec_from_dict(d: Dict) -> SourceSpec:
     required = ["provider", "species", "assembly", "fasta_url"]
     missing = [k for k in required if k not in d or not d[k]]
     if missing:
-        raise ValueError(f"Invalid source entry; missing {missing}: {d}")
+        raise SystemExit(f"Invalid source entry; missing {missing}: {d}")
     return SourceSpec(
         provider=d["provider"],
         species=d["species"],
@@ -449,9 +379,7 @@ def _spec_from_dict(d: Dict) -> SourceSpec:
         decompress_fasta=bool(d.get("decompress_fasta", True)),
     )
 
-
 # ---------------- Orchestration ----------------
-
 
 def run_once(
     cache_root: Path, publish_root: Path, manifest_path: Path, catalog: List[SourceSpec]
@@ -464,7 +392,6 @@ def run_once(
         gtf_meta = grab_gtf(cache_root, s)
         provide_symlinks(publish_root, s, fasta_meta, gtf_meta)
 
-        # keep manifest as-is
         results.append(
             {
                 "provider": s.provider,
@@ -475,15 +402,12 @@ def run_once(
             }
         )
 
-        # add a published record for later retrieval
         published_records.append(
             _build_published_record(s, publish_root, fasta_meta, gtf_meta)
         )
 
-    # write published index (for other processes)
     write_published_index(publish_root, published_records, PUBLISHED_INDEX_PATH)
 
-    # write manifest (unchanged)
     manifest = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "base": str(BASE),
@@ -491,7 +415,7 @@ def run_once(
         "publish_root": str(publish_root),
         "schema": {
             "cache": "{cache}/{provider}/{species}/{assembly}/{raw|ready}/...",
-            "publish": "{publish}/{provider}/{species}/genome.fa, genes{.gtf|.gff3}.gz",
+            "publish": "{publish}/{provider}/{species}/genome.fa, genes{.gtf|.gff|.gff3}(.gz)",
         },
         "sources": results,
     }
@@ -499,7 +423,6 @@ def run_once(
     tmp = manifest_path.with_suffix(manifest_path.suffix + ".part")
     tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
     shutil.move(tmp, manifest_path)
-
 
 def main():
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -509,7 +432,6 @@ def main():
     catalog = load_catalog()
     run_once(CACHE_ROOT, PUBLISH_ROOT, MANIFEST_PATH, catalog)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

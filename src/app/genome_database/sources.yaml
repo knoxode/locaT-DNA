@@ -1,9 +1,10 @@
 sources:
+  - provider: ensemblplants
     species: Arabidopsis_thaliana
     assembly: TAIR10
     fasta_url: https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/fasta/arabidopsis_thaliana/dna/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa.gz
-    gtf_url:   https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/gtf/arabidopsis_thaliana/Arabidopsis_thaliana.TAIR10.61.gtf.gz
-    decompress_fasta: true   # default true
+    gtf_url: https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/gtf/arabidopsis_thaliana/Arabidopsis_thaliana.TAIR10.61.gtf.gz
+    decompress_fasta: true
 
   - provider: solgenomics
     species: Solanum_lycopersicum
