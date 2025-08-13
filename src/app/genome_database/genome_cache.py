@@ -12,12 +12,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 try:
     import yaml  # optional; only needed for refresh_from_sources()
 except Exception:
     yaml = None
+
 
 # ---------- Data model ----------
 
@@ -28,18 +30,20 @@ class SourceSpec:
     assembly: str
     fasta_url: str
     anno_url: Optional[str] = None
-    decompress_fasta: bool = True
+    # For JBrowse we prefer to keep FASTA bgzip-compressed
+    decompress_fasta: bool = False  # default false now (bgzip + index instead)
+
 
 # ---------- GenomeCache ----------
 
 class GenomeCache:
     """
-    Single-process or multi-process safe cache manager.
+    Cache manager that produces JBrowse2-ready artifacts.
     Filesystem is the source of truth; SQLite stores inventory/state.
-    Publish uses atomic replace so readers never see partial files.
+    Publishing uses atomic replace so readers never see partial files.
     """
 
-    def __init__(self, base: Path | str = "/data/genome_cache", user_agent: str = "locaT-DNA-cache/0.1"):
+    def __init__(self, base: Path | str = "/data/genome_cache", user_agent: str = "locaT-DNA-cache/0.2-jb"):
         self.base = Path(base)
         self.cache_root = self.base / "cache"
         self.publish_root = self.base / "publish"
@@ -69,7 +73,7 @@ class GenomeCache:
         """
         with self._conn() as c:
             cur = c.execute("""
-                SELECT provider, species, assembly, genome_path
+                SELECT provider, species, assembly, genome_fa_gz
                 FROM genomes
                 WHERE state='published'
                 ORDER BY provider, species, assembly
@@ -81,7 +85,8 @@ class GenomeCache:
         Return published paths for a genome (latest if multiple assemblies and assembly not provided).
         """
         q = """
-            SELECT genome_path, genome_fai, anno_gz, anno_plain, assembly
+            SELECT genome_fa_gz, genome_fai, genome_gzi, anno_gz, anno_tbi, assembly,
+                   jbrowse_assembly_json, jbrowse_tracks_json
             FROM genomes
             WHERE provider=? AND species=? AND state='published'
         """
@@ -95,7 +100,16 @@ class GenomeCache:
             row = c.execute(q, params).fetchone()
             if not row:
                 raise KeyError(f"Not published: {provider}/{species}{('/'+assembly) if assembly else ''}")
-            return {"genome": row[0], "fai": row[1], "anno_gz": row[2], "anno": row[3], "assembly": row[4]}
+            return {
+                "genome_fa_gz": row[0],
+                "genome_fai": row[1],
+                "genome_gzi": row[2],
+                "anno_gz": row[3],
+                "anno_tbi": row[4],
+                "assembly": row[5],
+                "jbrowse_assembly_json": row[6],
+                "jbrowse_tracks_json": row[7],
+            }
 
     def ensure(self, spec: SourceSpec) -> Dict[str, Optional[str]]:
         """
@@ -103,14 +117,23 @@ class GenomeCache:
         Returns published paths.
         """
         g_id = self._upsert_genome(spec)
-        self._process_and_publish(g_id, spec)
+        self._process_and_publish(s=g_id, spec=spec)
         # return paths
         with self._conn() as c:
             row = c.execute("""
-                SELECT genome_path, genome_fai, anno_gz, anno_plain
+                SELECT genome_fa_gz, genome_fai, genome_gzi, anno_gz, anno_tbi,
+                       jbrowse_assembly_json, jbrowse_tracks_json
                 FROM genomes WHERE id=?
             """, (g_id,)).fetchone()
-        return {"genome": row[0], "fai": row[1], "anno_gz": row[2], "anno": row[3]}
+        return {
+            "genome_fa_gz": row[0],
+            "genome_fai": row[1],
+            "genome_gzi": row[2],
+            "anno_gz": row[3],
+            "anno_tbi": row[4],
+            "jbrowse_assembly_json": row[5],
+            "jbrowse_tracks_json": row[6],
+        }
 
     def refresh_from_sources(self, sources_file: Optional[Path | str] = None) -> None:
         """
@@ -120,7 +143,7 @@ class GenomeCache:
             species: Arabidopsis_thaliana
             assembly: TAIR10
             fasta_url: https://...
-            anno_url: https://...
+            anno_url: https://... (GFF3/GFF only; GTF is refused)
         """
         if sources_file is None:
             sources_file = self.sources_path
@@ -139,8 +162,9 @@ class GenomeCache:
                 assembly=d["assembly"],
                 fasta_url=d["fasta_url"],
                 anno_url=d.get("anno_url"),
-                decompress_fasta=bool(d.get("decompress_fasta", True)),
+                decompress_fasta=bool(d.get("decompress_fasta", False)),
             )
+            self._assert_not_gtf_url(spec.anno_url)  # refuse GTF upfront
             self.ensure(spec)
 
     # ---------- Internals ----------
@@ -165,17 +189,21 @@ class GenomeCache:
                 anno_url TEXT,
                 state TEXT NOT NULL DEFAULT 'missing',  -- missing/downloading/ready/published/error
                 last_error TEXT,
-                -- paths (absolute)
-                raw_fa_gz TEXT,
-                raw_anno_gz TEXT,
-                ready_fa TEXT,
-                ready_fai TEXT,
-                ready_anno_gz TEXT,
-                ready_anno_plain TEXT,
-                genome_path TEXT,
+                -- paths (absolute, "ready" = in cache; "genome_*" = published)
+                raw_fa TEXT,          -- as downloaded (could be .fa or .fa.gz)
+                raw_anno TEXT,        -- as downloaded (GFF3/GFF, possibly compressed)
+                ready_fa_gz TEXT,     -- bgzip FASTA
+                ready_fai TEXT,       -- FASTA .fai (for .fa.gz)
+                ready_gzi TEXT,       -- FASTA .gzi
+                ready_anno_gz TEXT,   -- bgzip annotation (gff3.gz)
+                ready_anno_tbi TEXT,  -- tabix index for annotation
+                genome_fa_gz TEXT,
                 genome_fai TEXT,
+                genome_gzi TEXT,
                 anno_gz TEXT,
-                anno_plain TEXT,
+                anno_tbi TEXT,
+                jbrowse_assembly_json TEXT,
+                jbrowse_tracks_json TEXT,
                 -- caching headers
                 etag_fa TEXT,
                 lastmod_fa TEXT,
@@ -200,6 +228,9 @@ class GenomeCache:
             return int(row[0])
 
     # layout
+    def _url_basename(self, url: str) -> str:
+        return Path(urlparse(url).path).name or "annotation.gff3"
+
     def _layout(self, s: SourceSpec) -> Dict[str, Path]:
         base = self.cache_root / s.provider / s.species / s.assembly
         raw = base / "raw"
@@ -207,91 +238,141 @@ class GenomeCache:
         raw.mkdir(parents=True, exist_ok=True)
         ready.mkdir(parents=True, exist_ok=True)
 
-        ext = self._anno_ext(s.anno_url) if s.anno_url else None
+        # keep raw annotation filename from URL (preserves .gff/.gff3[.gz])
+        raw_anno = (raw / self._url_basename(s.anno_url)) if s.anno_url else None
+        # publish/ready annotation is always GFF3
         return {
             "base": base,
-            "raw_fa_gz": raw / "genome.fa.gz",
-            "raw_anno_gz": (raw / f"genes{ext}.gz") if ext else None,
-            "ready_fa": ready / "genome.fa",
-            "ready_fai": ready / "genome.fa.fai",
-            "ready_anno_gz": (ready / f"genes{ext}.gz") if ext else None,
-            "ready_anno_plain": (ready / f"genes{ext}") if ext else None,
-            "pub_dir": self.publish_root / s.provider / s.species,
+            "raw_fa": raw / ("genome.fa.gz" if str(s.fasta_url).lower().endswith(".gz") else "genome.fa"),
+            "raw_anno": raw_anno,
+            "ready_fa_gz": ready / "genome.fa.gz",
+            "ready_fai": ready / "genome.fa.gz.fai",
+            "ready_gzi": ready / "genome.fa.gz.gzi",
+            "ready_anno_gz": (ready / "genes.gff3.gz") if s.anno_url else None,
+            "ready_anno_tbi": (ready / "genes.gff3.gz.tbi") if s.anno_url else None,
+            "pub_dir": self.publish_root / s.provider / s.species / s.assembly,
         }
 
     # processing pipeline
-    def _process_and_publish(self, g_id: int, s: SourceSpec) -> None:
-        paths = self._layout(s)
+    def _process_and_publish(self, s: int, spec: SourceSpec) -> None:
+        paths = self._layout(spec)
 
         with self._file_lock(paths["base"] / ".lock"):
-            self._set_state(g_id, "downloading")
+            self._set_state(s, "downloading")
 
-            # FASTA .fa.gz
-            etag_fa, lastmod_fa, changed_fa = self._download_with_cache(s.fasta_url, paths["raw_fa_gz"])
-            # Decompress if needed
-            if s.decompress_fasta and (changed_fa or not paths["ready_fa"].exists()):
-                self._decompress_any(paths["raw_fa_gz"], paths["ready_fa"])
+            # -------- FASTA --------
+            etag_fa, lastmod_fa, changed_fa = self._download_with_cache(spec.fasta_url, paths["raw_fa"])
+            # Ensure bgzip-compressed FASTA in ready path
+            # Cases:
+            #   - raw is uncompressed .fa  -> bgzip -> ready_fa_gz
+            #   - raw is gzip (.fa.gz)     -> re-bgzip to ensure block gzip (safe), or copy then normalize
+            if not paths["ready_fa_gz"].exists() or changed_fa:
+                if str(paths["raw_fa"]).endswith(".gz"):
+                    # normalize gzip to bgzip
+                    self._bgzip_normalize(src=paths["raw_fa"], dst=paths["ready_fa_gz"])
+                else:
+                    self._bgzip_from_plain(src=paths["raw_fa"], dst=paths["ready_fa_gz"])
 
-            # Index
-            self._run(["samtools", "faidx", str(paths["ready_fa"])])
+            # samtools faidx on bgzip FASTA -> creates .fai and .gzi alongside
+            self._run(["samtools", "faidx", str(paths["ready_fa_gz"])])
+            if not paths["ready_gzi"].exists():
+                self._run(["bgzip", "-r", str(paths["ready_fa_gz"])])
 
-            # Annotation (optional)
+            # -------- Annotation (optional, GFF/GFF3 only) --------
             etag_ann = lastmod_ann = None
-            if s.anno_url and paths["raw_anno_gz"] is not None:
-                etag_ann, lastmod_ann, changed_ann = self._download_with_cache(s.anno_url, paths["raw_anno_gz"])
-                # ready gz = copy (no symlink)
-                self._copy_atomic(paths["raw_anno_gz"], paths["ready_anno_gz"])
-                # ready plain
-                if changed_ann or not paths["ready_anno_plain"].exists():
-                    self._decompress_any(paths["raw_anno_gz"], paths["ready_anno_plain"])
+            anno_gz = anno_tbi = None
+            if spec.anno_url and paths["raw_anno"] is not None:
+                self._assert_not_gtf_url(spec.anno_url)  # defense in depth
+                etag_ann, lastmod_ann, changed_ann = self._download_with_cache(spec.anno_url, paths["raw_anno"])
+                if (changed_ann or not paths["ready_anno_gz"].exists() or not paths["ready_anno_tbi"].exists()):
+                    # produce bgzip+tabix with coordinate sort while preserving headers
+                    self._prepare_annotation_for_tabix(
+                        src=paths["raw_anno"],
+                        dst_gz=paths["ready_anno_gz"],
+                        dst_tbi=paths["ready_anno_tbi"]
+                    )
+                anno_gz  = paths["ready_anno_gz"]
+                anno_tbi = paths["ready_anno_tbi"]
 
-            # Publish atomically
+            # -------- Publish atomically --------
             pub = paths["pub_dir"]; pub.mkdir(parents=True, exist_ok=True)
-            genome_dst = pub / "genome.fa"
-            self._copy_atomic(paths["ready_fa"], genome_dst)
-            fai_dst = pub / "genome.fa.fai"
-            self._copy_atomic(paths["ready_fai"], fai_dst) if paths["ready_fai"].exists() else None
 
-            anno_gz_dst = anno_plain_dst = None
-            if s.anno_url:
-                ext = self._anno_ext(s.anno_url)
-                anno_gz_dst = pub / f"genes{ext}.gz"
-                anno_plain_dst = pub / f"genes{ext}"
-                self._copy_atomic(paths["ready_anno_gz"], anno_gz_dst)
-                self._copy_atomic(paths["ready_anno_plain"], anno_plain_dst)
+            genome_fa_gz = pub / "genome.fa.gz"
+            genome_fai   = pub / "genome.fa.gz.fai"
+            genome_gzi   = pub / "genome.fa.gz.gzi"
+            self._copy_atomic(paths["ready_fa_gz"], genome_fa_gz)
+            self._copy_atomic(paths["ready_fai"],   genome_fai) if paths["ready_fai"].exists() else None
+            self._copy_atomic(paths["ready_gzi"],   genome_gzi) if paths["ready_gzi"].exists() else None
 
-            # DB update -> published
+            if anno_gz and anno_tbi:
+                out_anno_gz  = pub / "genes.gff3.gz"
+                out_anno_tbi = pub / "genes.gff3.gz.tbi"
+                self._copy_atomic(anno_gz, out_anno_gz)
+                self._copy_atomic(anno_tbi, out_anno_tbi)
+
+            # -------- JBrowse helper configs --------
+            jbrowse_assembly_json = pub / "jbrowse_assembly.json"
+            jbrowse_tracks_json   = pub / "jbrowse_tracks.json"
+            self._write_jbrowse_snippets(
+                assembly_json_path=jbrowse_assembly_json,
+                tracks_json_path=jbrowse_tracks_json,
+                provider=spec.provider,
+                species=spec.species,
+                assembly=spec.assembly,
+                genome_fa_gz=genome_fa_gz,
+                genome_fai=genome_fai,
+                genome_gzi=genome_gzi,
+                anno_gz=(pub / "genes.gff3.gz") if (anno_gz and anno_tbi) else None,
+                anno_tbi=(pub / "genes.gff3.gz.tbi") if (anno_gz and anno_tbi) else None,
+            )
+
+            # -------- DB update -> published --------
             with self._conn() as c:
                 c.execute("""
                     UPDATE genomes SET
                         state='published', last_error=NULL,
-                        raw_fa_gz=?, raw_anno_gz=?,
-                        ready_fa=?, ready_fai=?,
-                        ready_anno_gz=?, ready_anno_plain=?,
-                        genome_path=?, genome_fai=?,
-                        anno_gz=?, anno_plain=?,
+                        raw_fa=?, raw_anno=?,
+                        ready_fa_gz=?, ready_fai=?, ready_gzi=?,
+                        ready_anno_gz=?, ready_anno_tbi=?,
+                        genome_fa_gz=?, genome_fai=?, genome_gzi=?,
+                        anno_gz=?, anno_tbi=?,
+                        jbrowse_assembly_json=?, jbrowse_tracks_json=?,
                         etag_fa=?, lastmod_fa=?, etag_anno=?, lastmod_anno=?,
                         updated_at=strftime('%s','now')
                     WHERE id=?
                 """, (
-                    str(paths["raw_fa_gz"]),
-                    str(paths["raw_anno_gz"]) if s.anno_url else None,
-                    str(paths["ready_fa"]),
+                    str(paths["raw_fa"]),
+                    str(paths["raw_anno"]) if spec.anno_url else None,
+                    str(paths["ready_fa_gz"]),
                     str(paths["ready_fai"]),
-                    str(paths["ready_anno_gz"]) if s.anno_url else None,
-                    str(paths["ready_anno_plain"]) if s.anno_url else None,
-                    str(genome_dst),
-                    str(fai_dst) if (paths["ready_fai"].exists()) else None,
-                    str(anno_gz_dst) if s.anno_url else None,
-                    str(anno_plain_dst) if s.anno_url else None,
+                    str(paths["ready_gzi"]),
+                    str(paths["ready_anno_gz"]) if spec.anno_url else None,
+                    str(paths["ready_anno_tbi"]) if spec.anno_url else None,
+                    str(genome_fa_gz),
+                    str(genome_fai) if paths["ready_fai"].exists() else None,
+                    str(genome_gzi) if paths["ready_gzi"].exists() else None,
+                    str(pub / "genes.gff3.gz") if (anno_gz and anno_tbi) else None,
+                    str(pub / "genes.gff3.gz.tbi") if (anno_gz and anno_tbi) else None,
+                    str(jbrowse_assembly_json),
+                    str(jbrowse_tracks_json),
                     etag_fa, lastmod_fa, etag_ann, lastmod_ann,
-                    g_id
+                    s
                 ))
 
             # refresh public index.json
             self._rewrite_public_index()
 
-    # utilities
+    # ---------- utilities ----------
+
+    @staticmethod
+    def _assert_not_gtf_url(url: Optional[str]) -> None:
+        if not url:
+            return
+        u = url.lower()
+        if u.endswith(".gtf") or u.endswith(".gtf.gz"):
+            raise ValueError(
+                f"GTF is not supported by GenomeCache. Please provide a GFF3/GFF URL instead: {url}"
+            )
 
     def _set_state(self, g_id: int, state: str, err: Optional[str] = None):
         with self._conn() as c:
@@ -300,13 +381,19 @@ class GenomeCache:
 
     @staticmethod
     def _anno_ext(url: Optional[str]) -> str:
+        """
+        Normalized publish extension for annotations: always GFF3.
+        Refuses GTF input.
+        """
         if not url:
-            return ".gtf"
+            return ".gff3"
         u = url.lower()
-        for ext in (".gff3.gz", ".gff.gz", ".gtf.gz", ".gff3", ".gff", ".gtf"):
-            if u.endswith(ext):
-                return "." + ext.lstrip(".").split(".")[0]
-        return ".gtf"
+        if u.endswith(".gtf") or u.endswith(".gtf.gz"):
+            raise ValueError(
+                f"GTF is not supported by GenomeCache. Please provide a GFF3/GFF URL instead: {url}"
+            )
+        # Accept .gff and .gff3 inputs; we publish as .gff3
+        return ".gff3"
 
     @contextlib.contextmanager
     def _file_lock(self, lock_path: Path):
@@ -349,7 +436,6 @@ class GenomeCache:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         fh.write(chunk)
-            # atomic move
             os.replace(tmp, target)
 
             etag = r.headers.get("ETag"); lastmod = r.headers.get("Last-Modified")
@@ -365,6 +451,33 @@ class GenomeCache:
         if head.startswith(b"BZh"):      return "bz2"
         if head.startswith(b"\xfd7zXZ\x00"): return "xz"
         return "plain"
+
+    def _bgzip_from_plain(self, src: Path, dst: Path) -> None:
+        tmp = dst.with_suffix(".part")
+        # stream through bgzip
+        with open(src, "rb") as fin, open(tmp, "wb") as fout:
+            p = subprocess.Popen(["bgzip", "-c"], stdin=fin, stdout=fout)
+            p.wait()
+            if p.returncode != 0:
+                raise RuntimeError("bgzip failed on FASTA/annotation")
+            fout.flush(); os.fsync(fout.fileno())
+        os.replace(tmp, dst)
+
+    def _bgzip_normalize(self, src: Path, dst: Path) -> None:
+        """
+        Recompress arbitrary gzip as bgzip so we can tabix/faidx properly.
+        """
+        if src.resolve() == dst.resolve():
+            # in-place normalize
+            self._run(["bgzip", "-f", str(src)])
+            return
+        tmp_plain = dst.with_suffix(".tmp.dec")
+        self._decompress_any(src, tmp_plain)
+        try:
+            self._bgzip_from_plain(tmp_plain, dst)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(tmp_plain)
 
     def _decompress_any(self, src: Path, dst: Path) -> None:
         def _open(p: Path):
@@ -388,15 +501,107 @@ class GenomeCache:
     def _copy_atomic(src: Path, dst: Path) -> None:
         tmp = dst.with_suffix(dst.suffix + ".part")
         shutil.copy2(src, tmp)
-        # ensure written to disk before replace
         with open(tmp, "rb") as f:
             os.fsync(f.fileno())
         os.replace(tmp, dst)
 
+    def _prepare_annotation_for_tabix(self, src: Path, dst_gz: Path, dst_tbi: Path) -> None:
+        """
+        Produce bgzip+tabix for GFF/GFF3:
+          - accept plain or compressed input (gz/bz2/xz)
+          - preserve header lines (#...)
+          - coordinate sort non-header lines by (seqid, start)
+          - bgzip to dst_gz
+          - tabix -p gff -> dst_tbi
+        """
+        tmp_plain  = dst_gz.with_suffix(".plain")
+        tmp_sorted = dst_gz.with_suffix(".sorted")
+        tmp_header = dst_gz.with_suffix(".hdr")
+        tmp_body   = dst_gz.with_suffix(".body")
+
+        # 1) ensure plain text input
+        self._decompress_any(src, tmp_plain)
+
+        # 2) split header/body
+        with open(tmp_plain, "rt", encoding="utf-8", errors="ignore") as fin, \
+             open(tmp_header, "wt", encoding="utf-8") as fh, \
+             open(tmp_body,   "wt", encoding="utf-8") as fb:
+            for line in fin:
+                (fh if line.startswith("#") else fb).write(line)
+
+        # 3) sort body; concat header + sorted body
+        subprocess.run(
+            ["bash", "-lc", f"cat {tmp_header} > {tmp_sorted} && "
+                            f"LC_ALL=C sort -t $'\\t' -k1,1 -k4,4n {tmp_body} >> {tmp_sorted}"],
+            check=True
+        )
+
+        # 4) bgzip + tabix
+        self._bgzip_from_plain(tmp_sorted, dst_gz)
+        self._run(["tabix", "-f", "-p", "gff", str(dst_gz)])
+
+        # 5) cleanup
+        for p in (tmp_plain, tmp_sorted, tmp_header, tmp_body):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(p)
+
+    def _write_jbrowse_snippets(
+        self,
+        assembly_json_path: Path,
+        tracks_json_path: Path,
+        provider: str,
+        species: str,
+        assembly: str,
+        genome_fa_gz: Path,
+        genome_fai: Path,
+        genome_gzi: Path,
+        anno_gz: Optional[Path],
+        anno_tbi: Optional[Path],
+    ) -> None:
+        """
+        Emit small JSON files you can import into JBrowse 2 or into a React Linear Genome View.
+        Paths are emitted as relative-to-their-location (same dir), which makes hosting easy.
+        """
+        assembly_conf = {
+            "name": f"{species} {assembly}",
+            "sequence": {
+                "type": "ReferenceSequenceTrack",
+                "trackId": "refseq",
+                "adapter": {
+                    "type": "BgzipFastaAdapter",
+                    "fastaLocation": {"uri": "genome.fa.gz"},
+                    "faiLocation": {"uri": "genome.fa.gz.fai"},
+                    "gziLocation": {"uri": "genome.fa.gz.gzi"},
+                },
+            },
+        }
+
+        tracks = []
+        if anno_gz and anno_tbi:
+            tracks.append({
+                "type": "FeatureTrack",
+                "trackId": "genes",
+                "name": "Genes",
+                "assemblyNames": [f"{species} {assembly}"],
+                "adapter": {
+                    "type": "Gff3TabixAdapter",
+                    "gffGzLocation": {"uri": anno_gz.name},
+                    "index": {"location": {"uri": anno_tbi.name}},
+                },
+                "category": ["Annotations"],
+                "renderer": {"type": "SvgFeatureRenderer"},
+            })
+
+        assembly_json_path.write_text(json.dumps(assembly_conf, indent=2))
+        tracks_json_path.write_text(json.dumps(tracks, indent=2))
+
     def _rewrite_public_index(self) -> None:
         with self._conn() as c:
             rows = c.execute("""
-                SELECT provider, species, assembly, genome_path, genome_fai, anno_gz, anno_plain, updated_at
+                SELECT provider, species, assembly,
+                       genome_fa_gz, genome_fai, genome_gzi,
+                       anno_gz, anno_tbi, updated_at,
+                       jbrowse_assembly_json, jbrowse_tracks_json
                 FROM genomes WHERE state='published'
                 ORDER BY provider, species, assembly
             """).fetchall()
@@ -407,13 +612,16 @@ class GenomeCache:
                 "provider": r["provider"],
                 "species": r["species"],
                 "assembly": r["assembly"],
-                "genome_path": r["genome_path"],
+                "genome_fa_gz": r["genome_fa_gz"],
                 "genome_fai": r["genome_fai"],
-                "anno_gz_path": r["anno_gz"],
-                "anno_plain_path": r["anno_plain"],
+                "genome_gzi": r["genome_gzi"],
+                "anno_gz": r["anno_gz"],
+                "anno_tbi": r["anno_tbi"],
+                "jbrowse_assembly_json": r["jbrowse_assembly_json"],
+                "jbrowse_tracks_json": r["jbrowse_tracks_json"],
                 "mtime": int(r["updated_at"]),
             } for r in rows],
-            "version": 1,
+            "version": 2,
         }
         tmp = self.index_json.with_suffix(self.index_json.suffix + ".part")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))

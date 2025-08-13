@@ -3,14 +3,12 @@ sources:
     species: Arabidopsis_thaliana
     assembly: TAIR10
     fasta_url: https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/fasta/arabidopsis_thaliana/dna/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa.gz
-    gtf_url: https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/gtf/arabidopsis_thaliana/Arabidopsis_thaliana.TAIR10.61.gtf.gz
+    anno_url: https://www.arabidopsis.org/api/download-files/download?filePath=Genes/Araport11_genome_release/Araport11_GFF3_genes_transposons.current.gff.gz
     decompress_fasta: true
 
   - provider: solgenomics
     species: Solanum_lycopersicum
     assembly: SL4.0
     fasta_url: https://solgenomics.net/ftp/genomes/Solanum_lycopersicum/assembly/build_4.00/S_lycopersicum_chromosomes.4.00.fa.gz
-    gtf_url: https://solgenomics.net/ftp/genomes/Solanum_lycopersicum/annotation/ITAG4.1_release/ITAG4.1_gene_models.gff
+    anno_url: https://solgenomics.net/ftp/genomes/Solanum_lycopersicum/annotation/ITAG4.1_release/ITAG4.1_gene_models.gff
     decompress_fasta: true
-
-
